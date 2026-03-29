@@ -2,72 +2,101 @@ from flask import current_app as app, request, jsonify, render_template
 import requests
 from .models import HistorialBusqueda
 from . import db
+import re
+from bs4 import BeautifulSoup
 
-# --- RUTA DE LA INTERFAZ WEB ---
+# --- 1. FUNCIÓN DE EXTRACCIÓN (REGEX) ---
+def extraer_precio_regex(texto):
+    if not texto: return None
+    patron = r'\$\s?(\d{1,3}(\.\d{3})*(,\d+)?|\d+)'
+    resultado = re.search(patron, texto)
+    return resultado.group(0) if resultado else None
+
+# --- 2. DEEP SCRAPING GENÉRICO ---
+def obtener_precio_deep(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code != 200: return None
+        
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        # Estrategia Meta: Buscar en etiquetas de SEO
+        meta = soup.find("meta", property="product:price:amount") or soup.find("meta", itemprop="price")
+        if meta and meta.get("content"):
+            return f"$ {meta.get('content')}"
+
+        # Estrategia Heurística: Buscar clases con 'price' o 'precio'
+        tags = soup.find_all(class_=re.compile(r'price|precio|vtex-product-price', re.I))
+        for t in tags:
+            p = extraer_precio_regex(t.get_text())
+            if p: return p
+        return None
+    except:
+        return None
+
+# --- 3. RUTA DE LA INTERFAZ (Única función 'inicio') ---
 @app.route('/')
-def home():
-    # Esta ruta ahora devuelve el archivo HTML visual
+def inicio(): # Le cambié el nombre a 'inicio' para evitar el AssertionError
     return render_template('index.html')
 
-# --- RUTA DE LA API (JSON para Postman o el Frontend) ---
+# --- 4. RUTA DE LA API (Única función 'buscar') ---
 @app.route('/api/buscar', methods=['GET'])
-def buscar_perfume():
+def buscar(): # Le cambié el nombre a 'buscar'
     query = request.args.get('q')
+    modo = request.args.get('modo', 'general')
     
     if not query:
-        return jsonify({"error": "Por favor, ingresa un perfume a buscar usando el parámetro ?q="}), 400
+        return jsonify({"error": "Ingresa un perfume"}), 400
 
-    # Guardamos en la base de datos
+    # DB Log
     try:
-        nueva_busqueda = HistorialBusqueda(termino=query)
-        db.session.add(nueva_busqueda)
+        db.session.add(HistorialBusqueda(termino=query))
         db.session.commit()
-    except Exception as e:
+    except:
         db.session.rollback()
-        print(f"Error al guardar en BD: {e}")
 
+    # SerpApi
     api_key = app.config.get('SERPAPI_KEY')
-    if not api_key:
-        return jsonify({"error": "Falta configurar la SERPAPI_KEY en el .env"}), 500
-
-    url = "https://serpapi.com/search"
-    termino_busqueda = f"{query} site:juleriaque.com.ar OR site:parfumerie.com.ar OR site:rouge.com.ar"
+    url_serp = "https://serpapi.com/search"
+    # Query optimizada para Argentina
+    q_final = f'"{query}" perfume Argentina (site:.com.ar OR "tienda oficial")'
     
-    parametros = {
-        "engine": "google",
-        "q": termino_busqueda,
-        "gl": "ar", 
-        "hl": "es", 
-        "api_key": api_key
-    }
-
+    params = {"engine": "google", "q": q_final, "gl": "ar", "hl": "es", "api_key": api_key}
+    
     try:
-        respuesta = requests.get(url, params=parametros)
-        
-        if respuesta.status_code != 200:
-            return jsonify({
-                "error": f"SerpApi rechazó la petición (Código {respuesta.status_code})",
-                "detalle": respuesta.json()
-            }), respuesta.status_code
-            
-        datos_google = respuesta.json()
-        
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": "Fallo crítico en la red", "detalle": str(e)}), 500
+        res = requests.get(url_serp, params=params)
+        items = res.json().get('organic_results', [])
+    except:
+        return jsonify({"error": "Error de conexión"}), 500
 
-    resultados_limpios = []
-    items = datos_google.get('organic_results', [])
-    
+    resultados = []
     for item in items:
-        resultado = {
-            "titulo": item.get('title'),
-            "link": item.get('link'),
-            "descripcion": item.get('snippet')
-        }
-        resultados_limpios.append(resultado)
+        link = item.get('link')
+        # Intentamos snippet primero
+        precio = extraer_precio_regex(item.get('snippet', ''))
+        
+        # Deep Scraping si es necesario
+        if modo == 'precios' and not precio:
+            precio = obtener_precio_deep(link)
 
-    return jsonify({
-        "busqueda": query,
-        "cantidad_resultados": len(resultados_limpios),
-        "resultados": resultados_limpios
-    })
+        # Si en modo precios no hay nada tras el deep scraping, mostramos un aviso 
+        # para no "borrar" el resultado, pero que el usuario sepa qué pasa
+        if modo == 'precios' and not precio:
+            precio = "Ver precio en sitio"
+
+        resultados.append({
+            "titulo": item.get('title'),
+            "link": link,
+            "descripcion": item.get('snippet'),
+            "precio": precio
+        })
+
+    # Ordenar por precio si corresponde
+    if modo == 'precios':
+        def val(x):
+            nums = re.sub(r'[^\d]', '', x['precio'])
+            return int(nums) if nums else 999999999
+        resultados.sort(key=val)
+
+    return jsonify({"resultados": resultados})
